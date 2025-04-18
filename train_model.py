@@ -1,24 +1,23 @@
-'''
+#!/usr/bin/env python3
+"""
+train_model.py
+
 Pipeline to:
-
-1. Load the graph data
-2. Split the samples into training, validation, and testing.
-3. Create a PyTorch Geometric object for the graph.
-4. Define an edge classification GNN model that :
-    a. computes nodes embeddings via graph convolutions
-    b. uses an MLP on concatenated node embeddings for each edge to predict a binary label
-5. Train the model and track loss, accuracy, precision, recall, and F1 score.
-6. At inference, use a greedy search on predicted edge scores to reconstruct the chromosome.
-
+1. Load graph data (node features, edges, edge labels).
+2. Split edges into train/validation/test with stratification.
+3. Create a PyTorch Geometric Data object and move it to device.
+4. Define an edge classification GNN (two-layer GCN + MLP).
+5. Train the model, tracking loss, accuracy, precision, recall, and F1; save checkpoints.
+6. Reconstruct the Hamiltonian cycle via greedy search on predicted edge scores.
 
 Usage:
-    python train_model.py <graph_data_pickle>
+    python train_model.py <graph_data_pickle> [--epochs E] [--lr LR] [--wd WD] [--patience P]
 
 Example:
-    python train_model.py graph_data.pkl
+    python train_model.py graph_data.pkl --epochs 100 --lr 0.01 --wd 1e-4 --patience 10
+"""
 
-'''
-
+import argparse
 import pickle
 import numpy as np
 import torch
@@ -31,177 +30,152 @@ from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.model_selection import train_test_split
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from sklearn.metrics import confusion_matrix
+from concurrent.futures import ThreadPoolExecutor as ProcessPoolExecutor
+
+def _hybrid_expand_one(path, visited_set, lp, out_edges, top_k):
+    """Top‑level helper so it can be pickled by ProcessPoolExecutor."""
+    curr = path[-1]
+    neigh = sorted(out_edges.get(curr, []), key=lambda x: -x[1])[:top_k]
+    results = []
+    for nxt, sc in neigh:
+        if nxt in visited_set:
+            continue
+        new_path    = path + [nxt]
+        new_visited = visited_set | {nxt}
+        new_lp      = lp + np.log(sc + 1e-9)
+        results.append((new_path, new_visited, new_lp))
+    return results
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print("Using device:", device)
 
-# Set random seeds for reproducibility
 torch.manual_seed(42)
 np.random.seed(42)
 random.seed(42)
 
-# Edge classifier GNN: compute node embedding and classifies each edge.
+
+
+
 
 class EdgeClassifier(nn.Module):
     def __init__(self, in_channels, hidden_channels):
-        super(EdgeClassifier, self).__init__()
+        super().__init__()
         self.conv1 = GCNConv(in_channels, hidden_channels)
         self.conv2 = GCNConv(hidden_channels, hidden_channels)
-
-        # MLP for edge classification
         self.edge_mlp = nn.Sequential(
-            nn.Linear(2*hidden_channels, hidden_channels),
+            nn.Linear(2 * hidden_channels, hidden_channels),
             nn.ReLU(),
-            nn.Linear(hidden_channels,1) #output logit
+            nn.Linear(hidden_channels, 1)
         )
 
     def forward(self, x, edge_index):
-        #compute edge embeddings
-        x = self.conv1(x, edge_index)
-        x = F.relu(x)
+        x = F.relu(self.conv1(x, edge_index))
         x = self.conv2(x, edge_index)
-
-        #for each edge, get embeddings and source target
         src, tgt = edge_index
         edge_feat = torch.cat([x[src], x[tgt]], dim=1)
-        logits = self.edge_mlp(edge_feat).squeeze() #shape: [num_edges]
-
-        return logits
-
+        return self.edge_mlp(edge_feat).squeeze()
 
 def load_graph_data(pickle_file):
     with open(pickle_file, 'rb') as f:
-        data = pickle.load(f)
-
-    return data
+        return pickle.load(f)
 
 def create_data_object(graph_data):
-    '''
-    Create a PyTorch Geometric Data object for the full graph
-    The entire node feature matrix and edge_index (from edge list) are used.
-    '''
+    x = torch.tensor(graph_data['node_features'], dtype=torch.float).to(device)
+    edge_index = torch.tensor(graph_data['edges'], dtype=torch.long).t().contiguous().to(device)
+    return Data(x=x, edge_index=edge_index)
 
-    x = torch.tensor(graph_data['node_features'], dtype=torch.float)
-
-    #convert edge list into a tensor of shape [2, num_edges]
-    edge_index = torch.tensor(graph_data['edges'], dtype=torch.long).t().contiguous()
-    return Data(x = x, edge_index = edge_index)
-
-def split_edge_data(graph_data, test_size = 0.15, val_size = 0.15):
-    '''
-    Split the edge samples
-    Return indices for each split along with their labels
-    '''
+def split_edge_data(graph_data, test_size=0.15, val_size=0.15):
     edges = np.array(graph_data['edges'])
     labels = np.array(graph_data['edge_labels'])
-    num_edges = len(labels)
-    indices = np.arange(num_edges)
+    indices = np.arange(len(labels))
 
-    #Split off test set
     train_val_idx, test_idx, train_val_labels, test_labels = train_test_split(
-        indices, labels, test_size=test_size, random_state=42, stratify=labels)
-
-    #Now split off train_val into training and validation
-    # for 5-fold cross validation, loop over folds
-
+        indices, labels, test_size=test_size, random_state=42, stratify=labels
+    )
     val_fraction = val_size / (1 - test_size)
     train_idx, val_idx, train_labels, val_labels = train_test_split(
-        train_val_idx, train_val_labels, test_size=val_fraction, random_state=42, stratify=train_val_labels)
+        train_val_idx, train_val_labels, test_size=val_fraction,
+        random_state=42, stratify=train_val_labels
+    )
 
-    splits = {
-        'train_idx': train_idx,
-        'val_idx': val_idx,
-        'test_idx': test_idx,
-        'train_labels': torch.tensor(train_labels, dtype=torch.float),
-        'val_labels': torch.tensor(val_labels, dtype=torch.float),
-        'test_labels': torch.tensor(test_labels, dtype=torch.float)
+    return {
+        'train_idx': torch.tensor(train_idx, dtype=torch.long, device=device),
+        'val_idx':   torch.tensor(val_idx,   dtype=torch.long, device=device),
+        'test_idx':  torch.tensor(test_idx,  dtype=torch.long, device=device),
+        'train_labels': torch.tensor(train_labels, dtype=torch.float, device=device),
+        'val_labels':   torch.tensor(val_labels,   dtype=torch.float, device=device),
+        'test_labels':  torch.tensor(test_labels,  dtype=torch.float, device=device),
     }
-    return splits
 
-def evaluate(model, data, edge_index, true_labels):
-    """
-    Evaluate the edge classification performance.
-    Returns: loss, accuracy, precision, recall, f1.
-    """
+def evaluate(model, data, edge_idx, true_labels):
     model.eval()
     with torch.no_grad():
-        logits = model(data.x, data.edge_index)
-        # Select predictions for the specified edge indices.
+        logits = model(data.x, data.edge_index)[edge_idx]
+        loss = F.binary_cross_entropy_with_logits(logits, true_labels)
+        preds = (torch.sigmoid(logits) >= 0.5).cpu().numpy()
+        truths = true_labels.cpu().numpy()
+        return (
+            loss.item(),
+            accuracy_score(truths, preds),
+            precision_score(truths, preds, zero_division=0),
+            recall_score(truths, preds, zero_division=0),
+            f1_score(truths, preds, zero_division=0)
+        )
 
-        true_labels = true_labels.to(device)
-        preds = logits[edge_index]
-        loss = F.binary_cross_entropy_with_logits(preds, true_labels)
-        pred_labels = (torch.sigmoid(preds) >= 0.5).cpu().numpy()
-        true_labels_np = true_labels.cpu().numpy()
-        acc = accuracy_score(true_labels_np, pred_labels)
-        prec = precision_score(true_labels_np, pred_labels, zero_division=0)
-        rec = recall_score(true_labels_np, pred_labels, zero_division=0)
-        f1 = f1_score(true_labels_np, pred_labels, zero_division=0)
-    return loss.item(), acc, prec, rec, f1
-
-
-def train_model(model, data, splits, num_epochs=100, lr=0.01, weight_decay=1e-4, patience=10):
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+def train_model(model, data, splits, epochs, lr, wd, patience):
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True) #scheduler to smooth out late-stage spikes in training
     best_val_loss = float('inf')
     patience_counter = 0
 
-    # Get the full logits (we will index into them using splits).
-    full_edge_indices = torch.arange(data.edge_index.size(1))
+    metrics = {
+        'train_loss': [], 'val_loss': [],
+        'train_acc': [], 'val_acc': [],
+        'train_prec': [], 'val_prec': [],
+        'train_rec': [], 'val_rec': [],
+        'train_f1': [], 'val_f1': []
+    }
 
-    # Metrics trackers.
-    epochs_list = []
-    train_loss_list = []
-    val_loss_list = []
-    train_acc_list = []
-    val_acc_list = []
-    train_prec_list = []
-    val_prec_list = []
-    train_rec_list = []
-    val_rec_list = []
-    train_f1_list = []
-    val_f1_list = []
-
-    for epoch in range(1, num_epochs + 1):
+    for epoch in range(1, epochs + 1):
         model.train()
         optimizer.zero_grad()
         logits = model(data.x, data.edge_index)
-
-        #move the lables to the GPU
-        train_labels = splits['train_labels'].to(device)
-        train_logits = logits[splits['train_idx'].to(device)]
-        train_loss = F.binary_cross_entropy_with_logits(train_logits, splits['train_labels'])
-        train_loss.backward()
+        loss = F.binary_cross_entropy_with_logits(
+            logits[splits['train_idx']],
+            splits['train_labels']
+        )
+        loss.backward()
         optimizer.step()
 
-        # Evaluate training metrics.
-        model.eval()
-        with torch.no_grad():
-            logits = model(data.x, data.edge_index)
-            # Training metrics.
-            train_loss_val, train_acc, train_prec, train_rec, train_f1 = evaluate(
-                model, data, splits['train_idx'], splits['train_labels'])
-            # Validation metrics.
-            val_loss_val, val_acc, val_prec, val_rec, val_f1 = evaluate(
-                model, data, splits['val_idx'], splits['val_labels'])
+        tr_loss, tr_acc, tr_prec, tr_rec, tr_f1 = evaluate(
+            model, data, splits['train_idx'], splits['train_labels']
+        )
+        va_loss, va_acc, va_prec, va_rec, va_f1 = evaluate(
+            model, data, splits['val_idx'], splits['val_labels']
+        )
 
-        epochs_list.append(epoch)
-        train_loss_list.append(train_loss_val)
-        val_loss_list.append(val_loss_val)
-        train_acc_list.append(train_acc)
-        val_acc_list.append(val_acc)
-        train_prec_list.append(train_prec)
-        val_prec_list.append(val_prec)
-        train_rec_list.append(train_rec)
-        val_rec_list.append(val_rec)
-        train_f1_list.append(train_f1)
-        val_f1_list.append(val_f1)
+        metrics['train_loss'].append(tr_loss)
+        metrics['val_loss'].append(va_loss)
+        metrics['train_acc'].append(tr_acc)
+        metrics['val_acc'].append(va_acc)
+        metrics['train_prec'].append(tr_prec)
+        metrics['val_prec'].append(va_prec)
+        metrics['train_rec'].append(tr_rec)
+        metrics['val_rec'].append(va_rec)
+        metrics['train_f1'].append(tr_f1)
+        metrics['val_f1'].append(va_f1)
 
-        print(f"Epoch {epoch:03d} | Train Loss: {train_loss_val:.4f}, Val Loss: {val_loss_val:.4f} | "
-              f"Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}")
+        print(f"Epoch {epoch:03d} | Train Loss: {tr_loss:.4f}, Val Loss: {va_loss:.4f} | Train Acc: {tr_acc:.4f}, Val Acc: {va_acc:.4f}")
+        scheduler.step(va_loss)
 
-        # Checkpoint saving.
-        if val_loss_val < best_val_loss:
-            best_val_loss = val_loss_val
+        if epoch %10 == 0:
+            _, _, p, r, f1 = evaluate(model, data, splits['val_idx'], splits['val_labels'])
+            print(f" -> Val P/R/F1 @epoch {epoch}: {p:.3f}/{r:.3f}/{f1:.3f}")
+
+        if va_loss < best_val_loss:
+            best_val_loss = va_loss
             patience_counter = 0
             torch.save(model.state_dict(), "best_model_checkpoint.pt")
             print("Checkpoint saved.")
@@ -211,145 +185,166 @@ def train_model(model, data, splits, num_epochs=100, lr=0.01, weight_decay=1e-4,
                 print("Early stopping triggered.")
                 break
 
-    # Plot loss and accuracy curves.
+    epochs_range = range(1, len(metrics['train_loss']) + 1)
     plt.figure(figsize=(14, 6))
     plt.subplot(1, 2, 1)
-    plt.plot(epochs_list, train_loss_list, label="Train Loss")
-    plt.plot(epochs_list, val_loss_list, label="Val Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Loss Curves")
-    plt.legend()
-
+    plt.plot(epochs_range, metrics['train_loss'], label='Train Loss')
+    plt.plot(epochs_range, metrics['val_loss'],   label='Val Loss')
+    plt.xlabel('Epoch'); plt.ylabel('Loss'); plt.legend(); plt.title('Loss')
     plt.subplot(1, 2, 2)
-    plt.plot(epochs_list, train_acc_list, label="Train Accuracy")
-    plt.plot(epochs_list, val_acc_list, label="Val Accuracy")
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy")
-    plt.title("Accuracy Curves")
-    plt.legend()
-
+    plt.plot(epochs_range, metrics['train_acc'], label='Train Acc')
+    plt.plot(epochs_range, metrics['val_acc'],   label='Val Acc')
+    plt.xlabel('Epoch'); plt.ylabel('Accuracy'); plt.legend(); plt.title('Accuracy')
     plt.tight_layout()
     plt.show()
 
-    # Optionally, plot Precision, Recall, and F1 score.
-    plt.figure(figsize=(12, 10))
-    plt.subplot(3, 1, 1)
-    plt.plot(epochs_list, train_prec_list, label="Train Precision")
-    plt.plot(epochs_list, val_prec_list, label="Val Precision")
-    plt.ylabel("Precision")
-    plt.legend()
-
-    plt.subplot(3, 1, 2)
-    plt.plot(epochs_list, train_rec_list, label="Train Recall")
-    plt.plot(epochs_list, val_rec_list, label="Val Recall")
-    plt.ylabel("Recall")
-    plt.legend()
-
-    plt.subplot(3, 1, 3)
-    plt.plot(epochs_list, train_f1_list, label="Train F1 Score")
-    plt.plot(epochs_list, val_f1_list, label="Val F1 Score")
-    plt.xlabel("Epoch")
-    plt.ylabel("F1 Score")
-    plt.legend()
-
-    plt.tight_layout()
-    plt.show()
-
-    return model, {
-        'epochs': epochs_list,
-        'train_loss': train_loss_list,
-        'val_loss': val_loss_list,
-        'train_acc': train_acc_list,
-        'val_acc': val_acc_list,
-        'train_prec': train_prec_list,
-        'val_prec': val_prec_list,
-        'train_rec': train_rec_list,
-        'val_rec': val_rec_list,
-        'train_f1': train_f1_list,
-        'val_f1': val_f1_list,
-    }
+    return model
 
 
-def greedy_cycle_reconstruction(data, model):
-    """
-    Given the full graph and a trained model, reconstruct the Hamiltonian cycle using a greedy search.
-    For simplicity, we start from node 0 (assumed to be the first in the ground truth) and at each step select
-    the outgoing edge with the highest predicted score that leads to an unvisited node.
-    Returns the list of node indices in the predicted cycle.
-    """
+def beam_cycle_dynamic_with_fallback(data, model,
+                                     greedy_frac=0.5,
+                                     beam_width=3,
+                                     top_k=5,
+                                     log_every=200_000):
+    # Greedy search
+    N = data.num_nodes
+    threshold = int(N* greedy_frac)
+
+    #Greedy greedy boy
     model.eval()
     with torch.no_grad():
-        logits = model(data.x, data.edge_index)
-        scores = torch.sigmoid(logits).cpu().numpy()
+        scores = torch.sigmoid(model(data.x, data.edge_index)).cpu().numpy()
+    scrs, tgts = data.edge_index.cpu().numpy()
 
-    num_nodes = data.x.size(0)
-    # Build a dictionary of outgoing edges: for each source, list (target, score, edge_index)
-    out_edges = {}
-    edge_index = data.edge_index.cpu().numpy()
-    for i in range(edge_index.shape[1]):
-        src, tgt = edge_index[:, i]
-        out_edges.setdefault(src, []).append((tgt, scores[i], i))
+    raw_edges = {}
+    for s, t, sc in zip(scrs, tgts, scores):
+        raw_edges.setdefault(s, []).append((t,sc))
 
-    visited = set()
-    cycle = []
-    current = 0  # starting node (for demonstration, we assume the ground truth starts at node 0)
-    visited.add(current)
-    cycle.append(current)
+    visited = {0}
+    cycle = [0]
 
-    while len(visited) < num_nodes:
-        candidates = out_edges.get(current, [])
-        # Filter candidates that lead to unvisited nodes.
-        candidates = [c for c in candidates if c[0] not in visited]
-        if not candidates:
-            print("No candidate edge found. Cycle reconstruction failed.")
+    while len(visited) < threshold:
+        curr = cycle[-1]
+        neigh = raw_edges.get(curr, [])
+        # local dynamic top_k
+        candidates = sorted(neigh, key=lambda x: -x[1])[:top_k]
+        for nxt, sc in candidates:
+            if nxt not in visited:
+                cycle.append(nxt)
+                visited.add(nxt)
+                break
+        else:
             break
-        # Greedily select candidate with highest score.
-        next_node = max(candidates, key=lambda x: x[1])[0]
-        cycle.append(next_node)
-        visited.add(next_node)
-        current = next_node
 
-    # Optionally, check if we can close the cycle by connecting back to the starting node.
-    return cycle
+        if len(cycle)% log_every == 0:
+            print(f"[Greedy] visited {len(visited)}/{N}")
+
+    print("Swapping to beam search...")
+
+
+    # 2) Beam phase (dynamic prune + fallback)
+    beam = [(cycle, visited, 0.0)]
+    final = []
+    best_reported = len(visited)
+    iteration = 0
+
+    while beam:
+        iteration += 1
+        if iteration % 1000 == 0:
+            print(f"[Beam] iter={iteration}, beam_size={len(beam)}")
+
+        candidates = []
+        for path, vs, lp in beam:
+            curr = path[-1]
+            neigh = raw_edges.get(curr, [])  # full neighbor list
+
+            # first try the top_k
+            local = sorted(neigh, key=lambda x: -x[1])[:top_k]
+            unvis = [(n, sc) for (n, sc) in local if n not in vs]
+
+            # if that fails, fallback to the single best from full list
+            if not unvis:
+                for n, sc in sorted(neigh, key=lambda x: -x[1]):
+                    if n not in vs:
+                        unvis = [(n, sc)]
+                        break
+
+            # now expand along whatever we got
+            for nxt, sc in unvis:
+                candidates.append((
+                    path + [nxt],
+                    vs | {nxt},
+                    lp + np.log(sc + 1e-9)
+                ))
+
+        if not candidates:
+            print("[Beam] no more expansions (even after fallback)")
+            break
+
+        # keep the top B by cumulative log‑prob
+        candidates.sort(key=lambda x: -x[2])
+        beam = candidates[:beam_width]
+
+        # check for completion
+        for path, vs, lp in beam:
+            if len(vs) == N:
+                final.append((path, lp))
+
+        # log coverage of best beam
+        best_len = len(beam[0][1])
+        if best_len >= best_reported + log_every:
+            best_reported = best_len
+            print(f"[Beam] best covers {best_len}/{N}")
+
+        if final:
+            break
+
+    # return result
+    return (max(final, key=lambda x: x[1])[0]
+            if final else
+            max(beam, key=lambda x: len(x[1]))[0])
 
 
 def main():
-    import sys
-    if len(sys.argv) != 2:
-        print("Usage: python train_gnn.py <graph_data_pickle>")
-        sys.exit(1)
-    pickle_file = sys.argv[1]
-    graph_data = load_graph_data(pickle_file)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("pickle_file", help="Graph data pickle")
+    parser.add_argument("--epochs",   type=int,   default=100,  help="Num epochs")
+    parser.add_argument("--lr",       type=float, default=0.01, help="Learning rate")
+    parser.add_argument("--wd",       type=float, default=1e-4, help="Weight decay")
+    parser.add_argument("--patience", type=int,   default=10,   help="Early stopping patience")
+    args = parser.parse_args()
 
-    # Create PyTorch Geometric Data object.
+    graph_data = load_graph_data(args.pickle_file)
     data = create_data_object(graph_data)
+    splits = split_edge_data(graph_data)
+    model = EdgeClassifier(data.num_node_features, hidden_channels=32).to(device)
 
-    # Split edge data into train/val/test sets.
-    splits = split_edge_data(graph_data, test_size=0.15, val_size=0.15)
+    model = train_model(
+        model, data, splits,
+        epochs=args.epochs,
+        lr=args.lr,
+        wd=args.wd,
+        patience=args.patience
+    )
 
-    # Define model.
-    in_channels = data.x.size(1)  # e.g. 31*4 = 124 features
-    hidden_channels = 32
-    model = EdgeClassifier(in_channels, hidden_channels).to(device) #leverage CUDA
-
-    # Train the model.
-    model, metrics = train_model(model, data, splits, num_epochs=100, lr=0.01, weight_decay=1e-4, patience=10)
-
-    # After training, load the best checkpoint.
     model.load_state_dict(torch.load("best_model_checkpoint.pt"))
+    test_metrics = evaluate(model, data, splits['test_idx'], splits['test_labels'])
+    print("Test  Loss: {:.4f}, Acc: {:.4f}, Prec: {:.4f}, Rec: {:.4f}, F1: {:.4f}".format(*test_metrics))
 
-    # Evaluate on the test set.
-    test_loss, test_acc, test_prec, test_rec, test_f1 = evaluate(
-        model, data, torch.tensor(splits['test_idx']), splits['test_labels'])
-    print(f"Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.4f}, "
-          f"Precision: {test_prec:.4f}, Recall: {test_rec:.4f}, F1: {test_f1:.4f}")
+    test_loss, test_acc, test_prec, test_rec, test_f1 = evaluate(model, data, splits['test_idx'], splits['test_labels'])
+    print(f"Test P/R/F1 {test_prec: .3f}/{test_rec:.3f}/{test_f1:.3f}")
 
-    # Reconstruct the Hamiltonian cycle using greedy search.
-    cycle = greedy_cycle_reconstruction(data, model)
-    print("Reconstructed cycle (node indices):")
-    print(cycle)
+    #confusion matrix
+    logits = model(data.x, data.edge_index)[splits['test_idx']]
+    preds = (torch.sigmoid(logits) >=0.5).cpu().numpy()
+    truths = splits['test_labels'].cpu().numpy()
+    print("Confusion Matrix: \n", confusion_matrix(truths, preds))
 
+
+    #Don't print this out - it's going to eat the entire console. Save your eyes.
+    #cycle = greedy_cycle_reconstruction(data, model)
+
+    #print("Reconstructed cycle (node indices):", cycle)
 
 if __name__ == "__main__":
     main()
