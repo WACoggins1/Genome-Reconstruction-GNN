@@ -1,29 +1,28 @@
-''' data processing script
 
-Pipeline to:
-1. Parse a FASTA file (each sequence assumed to be a chromosome)
-2. Segment each chromosome into k-mers (k = 31).
-3. Build the de Bruijn graph.
-4. Label the edges.
-5. Save the result.
+#!/usr/bin/env python3
+"""
+Build a unitig‑compressed de Bruijn graph from a FASTA.
 
-Usage:
-    python data_processing.py <input_fasta> <output_pickle>
+Pipeline:
+1. Parse FASTA (each record = chromosome)
+2. k‑mer segmentation (user‑specified k)
+3. Build de Bruijn graph
+4. Label true edges
+5. Compress into unitigs
+6. Save graph_data.pkl with:
+     - node_features (unitig features)
+     - edges (unitig‑level edges)
+     - edge_labels (unitig‑level labels)
+     - node_chroms (per‑unitig chromosome)
+"""
 
-Example:
-    python data_processing.py human_genome.fasta graph_data.pkl
-'''
-
-import sys
+import argparse
 import pickle
+from collections import defaultdict
 from Bio import SeqIO
 import numpy as np
 
-#Constants
-K = 31
-overlap = K - 1
-
-#one-hot encoding for nucleotides
+# one‑hot for A,C,G,T
 nucleotide_to_onehot = {
     'A': [1,0,0,0],
     'C': [0,1,0,0],
@@ -31,143 +30,142 @@ nucleotide_to_onehot = {
     'T': [0,0,0,1]
 }
 
-def onhot_encode_kmer(kmer):
-    #Encode a k-mer into a flatened one-hot vector
+def onehot_encode_kmer(kmer):
+    """Flattened one‑hot for a k‑mer."""
+    vec = []
+    for nuc in kmer:
+        vec.extend(nucleotide_to_onehot.get(nuc, [0,0,0,0]))
+    return vec
 
-    encoding = []
-    for nuc in kmer.upper():
-        encoding.extend(nucleotide_to_onehot.get(nuc, [0,0,0,0]))
-
-    return encoding
-
-def process_chromosome(chrom_id, sequence):
-    '''
-    For one chromosome, generate nodes and ground truth ordering.
-    Each node is a dictionary with keys: 'id', 'chrom', 'pos', 'kmer'.
-    We also record the ground truth ordering as a list of node ids in order
-    '''
-
-    nodes = []
-    gt_order = [] #ground truth order
-    n = len(sequence)
-    node_id = 0
-
-    #create a node for each k-mer
-    for pos in range(n - K + 1):
-        kmer = sequence[pos:pos+K]
-        node = {
-            'id':f"{chrom_id}_{node_id}", #create unique id using chromosome and local index
-            'chrom': chrom_id,
-            'pos': pos,
-            'kmer': kmer
-        }
-
+def process_chromosome(chrom_id, seq, k):
+    """Return list of node dicts and ground‑truth order for one chromosome."""
+    nodes, order = [], []
+    n = len(seq)
+    for pos in range(n - k + 1):
+        kmer = seq[pos:pos+k]
+        node = {'id':f"{chrom_id}_{pos}", 'chrom':chrom_id, 'pos':pos, 'kmer':kmer}
         nodes.append(node)
-        gt_order.append(node['id'])
-        node_id += 1
+        order.append(node['id'])
+    return nodes, order
 
-
-    return nodes, gt_order
-
-def build_graph(nodes):
-    """
-    Build a directed graph from nodes using de Bruijn overlap.
-    For each node, compare last 30 bases to first 30 of next. If they match, connect them.
-    """
-
-    #Build dictionaries to quickly look up nodes by prefix
-    prefix_dict= {}
-
+def build_graph(nodes, overlap):
+    """Build raw k‑mer overlap edges (labelled later)."""
+    prefix = defaultdict(list)
     for node in nodes:
-        prefix = node['kmer'][:overlap]
-        prefix_dict.setdefault(prefix, []).append(node['id'])
-
-    #create a mapping from node id to node for convenience
-    id_to_node = {node['id']: node for node in nodes}
-
-    #Build edges
+        prefix[node['kmer'][:overlap]].append(node['id'])
     edge_dict = {}
-
-    #First ad all edges based on overlap: for each node, check its suffix
     for node in nodes:
-        suffix = node['kmer'][-overlap:]
-        candidates = prefix_dict.get(suffix, [])
-        for cand_id in candidates:
-            # Add an edge from current node to candidate
-            edge_dict[(node['id'], cand_id)] = 0
-
+        suf = node['kmer'][-overlap:]
+        for tgt in prefix.get(suf, []):
+            edge_dict[(node['id'],tgt)] = 0
     return edge_dict
 
-def label_groundtruth_edges(edge_dict, gt_order):
-    '''
-    Label the ground truth edge (the consecutive ordering in gt_order) as 1
-    If edge already exists, update its label to 1.
-    Otherwise, add it.
-    '''
-    for i in range(len(gt_order)-1):
-        src = gt_order[i]
-        tgt = gt_order[i+1]
-        edge_dict[(src, tgt)] = 1 #ground truth edge
-
+def label_groundtruth(edge_dict, gt_order):
+    """Mark consecutive k‑mers along each chromosome as true edges."""
+    for a,b in zip(gt_order, gt_order[1:]):
+        edge_dict[(a,b)] = 1
     return edge_dict
 
-def main():
-    if len(sys.argv) != 3:
-        print("Usage: python data_preprocessing.py <input_fasta> <output_pickle>")
-        sys.exit(1)
+def compress_unitigs(edges):
+    """
+    Collapse maximal non‑branching chains into unitigs.
+    Returns comp_id (orig_node_idx→unitig_id) and list of unitig edges.
+    """
+    in_nb, out_nb = defaultdict(list), defaultdict(list)
+    for u,v in edges:
+        out_nb[u].append(v)
+        in_nb[v].append(u)
 
-    input_fasta = sys.argv[1]
-    output_pickle = sys.argv[2]
+    comp_id, next_id = {}, 0
+    for node in set(in_nb)|set(out_nb):
+        if node in comp_id: continue
+        u = node
+        # walk back to chain start
+        while len(in_nb[u])==1 and len(out_nb[in_nb[u][0]])==1:
+            u = in_nb[u][0]
+        # walk forward and collapse
+        comp_id[u] = next_id
+        v = u
+        while len(out_nb[v])==1 and len(in_nb[out_nb[v][0]])==1:
+            v = out_nb[v][0]
+            comp_id[v] = next_id
+        next_id += 1
 
-    all_nodes = []
-    all_gt_orders = [] #list of ground truth orders per chromosome
-    # Parse the FASTA file - each record is a chromosome
+    # build unitig edge set
+    unitig_edges = set()
+    for u,v in edges:
+        cu,cv = comp_id[u], comp_id[v]
+        if cu!=cv:
+            unitig_edges.add((cu,cv))
 
-    for record in SeqIO.parse(input_fasta, "fasta"):
-        chrom_id = record.id
-        sequence = str(record.seq).upper()
-        nodes, gt_order = process_chromosome(chrom_id, sequence)
+    # return a list mapping 0..N-1 orig_node→unitig and the edges
+    return [comp_id[i] for i in range(len(comp_id))], list(unitig_edges)
+
+def main(input_fasta, output_pickle, k):
+    overlap = k - 1
+
+    # 1) Parse & build raw graph
+    all_nodes, all_gt = [], []
+    for rec in SeqIO.parse(input_fasta, "fasta"):
+        seq = str(rec.seq).upper()
+        nodes, order = process_chromosome(rec.id, seq, k)
         all_nodes.extend(nodes)
-        all_gt_orders.extend(gt_order)
-        print(f"Processed chromosome {chrom_id}: {len(nodes)} nodes.")
+        all_gt.extend(order)
+        print(f"Parsed {rec.id}: {len(nodes)} k‑mers")
 
-    #Build the graph based on overlap
-    edge_dict = build_graph(all_nodes)
-    #label the ground truth edges
-    edge_dict = label_groundtruth_edges(edge_dict, all_gt_orders)
-    print(f"Total edges (after labeling): {len(edge_dict)}")
+    edge_dict = build_graph(all_nodes, overlap)
+    edge_dict = label_groundtruth(edge_dict, all_gt)
+    print(f"Raw edges: {len(edge_dict)}")
 
-    #prepare node features
-    node_features = {}
-    for node in all_nodes:
-        node_features[node['id']] = onhot_encode_kmer(node['kmer'])
+    # 2) Node features + node_chroms
+    idx_map = {node['id']:i for i,node in enumerate(all_nodes)}
+    feature_matrix = np.array([onehot_encode_kmer(n['kmer']) for n in all_nodes],dtype=np.float32)
+    node_chroms    = [n['chrom'] for n in all_nodes]
 
-    # Convert node_features to a list in the SAME order
-    node_id_to_index = {node['id']: idx for idx, node in enumerate(all_nodes)}
-    feature_matrix = [node_features[node['id']] for node in all_nodes]
-    feature_matrix = np.array(feature_matrix, dtype = np.float32)
+    # 3) Raw edge list + labels
+    edges, labels = [], []
+    for (s,t),lab in edge_dict.items():
+        if s in idx_map and t in idx_map:
+            edges.append((idx_map[s], idx_map[t]))
+            labels.append(lab)
 
-    # convert edge_dict to an edge list and label the list
-    edges = []
-    labels = []
-    for (src, tgt), label in edge_dict.items():
-        #convert node id strings to indeices.
+    # 4) Unitig compression
+    comp_id, unitig_edges = compress_unitigs(edges)
+    # unitig features (average of members)
+    members = defaultdict(list)
+    for orig,uid in enumerate(comp_id):
+        members[uid].append(orig)
+    unitig_feats = np.stack([feature_matrix[members[u]].mean(0) for u in sorted(members)])
+    # unitig labels (OR over underlying edges)
+    ulabel = {}
+    for (u,v),lab in zip(edges,labels):
+        cu,cv = comp_id[u], comp_id[v]
+        if cu!=cv:
+            ulabel[(cu,cv)] = ulabel.get((cu,cv),0) or lab
+    unitig_labels = [ulabel[e] for e in sorted(ulabel)]
+    unitig_edge_list = sorted(ulabel)
 
-        if src in node_id_to_index and tgt in node_id_to_index:
-            edges.append((node_id_to_index[src], node_id_to_index[tgt]))
-            labels.append(label)
+    # unitig chroms
+    unitig_chroms = []
+    for u in range(len(members)):
+        orig0 = members[u][0]
+        unitig_chroms.append(node_chroms[orig0])
 
-    # save graph data
+    # 5) Save compressed graph
     graph_data = {
-        'node_features': feature_matrix, #shape: [num_nodes, feature_dim]
-        'edges': edges,                  # list of (src, tgt) tuples
-        'edge_labels': labels            # list of binary labels for each edge
+        'node_features': unitig_feats,      # [num_unitigs, feat_dim]
+        'edges':         unitig_edge_list,  # [(cu,cv),...]
+        'edge_labels':   unitig_labels,     # [0/1,...]
+        'node_chroms':   unitig_chroms      # [chrom,...]
     }
-
     with open(output_pickle, 'wb') as f:
         pickle.dump(graph_data, f)
+    print(f"Wrote compressed graph with {len(unitig_feats)} unitigs to {output_pickle}")
 
-    print(f"Graph data saved to {output_pickle}")
-
-if __name__ =="__main__":
-    main()
+if __name__=="__main__":
+    p = argparse.ArgumentParser(description="Unitig‑compressed de Bruijn graph builder")
+    p.add_argument("input_fasta")
+    p.add_argument("output_pickle")
+    p.add_argument("--k", type=int, default=31)
+    args = p.parse_args()
+    main(args.input_fasta, args.output_pickle, args.k)
